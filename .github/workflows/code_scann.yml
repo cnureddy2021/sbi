@@ -1,0 +1,104 @@
+name: GitHub Code Scan and Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      repoName:
+        description: 'Repository name to inject into prompt'
+        required: false
+        default: ''
+
+env:
+  REPO_NAME: ${{ github.event.inputs.repoName }}
+
+jobs:
+  scan-and-report:
+    runs-on: ubuntu-latest
+    env:
+      api_key: ${{ secrets.API_KEY }}
+      ado_pat: ${{ secrets.ADO_PAT }}
+      ado_org: ${{ secrets.ADO_ORG }}
+      ado_project: ${{ secrets.ADO_PROJECT }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Python and PDF conversion dependencies
+        run: |
+          cd servers/github
+          pip install .
+          pip install markdown pdfkit
+          sudo apt-get update
+          sudo apt-get install -y wkhtmltopdf
+
+      - name: Inject API Key into Python files
+        run: |
+          cd servers/github
+          sed -i "s|api_key=\"REPLACE_ME\"|api_key=\"${{ secrets.API_KEY }}\"|" bash_chat_test.py
+          sed -i "s|api_key=\"REPLACE_ME\"|api_key=\"${{ secrets.API_KEY }}\"|" direct_llm_call.py
+
+      - name: Inject .env values
+        run: |
+          cd servers/github
+          echo "Injecting .env values used for auth for GitHub"
+          sed -i "s|ado_pat|${{ secrets.ADO_PAT }}|g" .env
+          sed -i "s|ado_org|${{ secrets.ADO_ORG }}|g" .env
+          sed -i "s|ado_project|${{ secrets.ADO_PROJECT }}|g" .env
+          cat .env
+
+      - name: Inject Repo Name into prompt.txt
+        run: |
+          cd servers/github
+          if [ -z "${{ env.REPO_NAME }}" ]; then
+            echo "⚠️ Warning: REPO_NAME is empty"
+          else
+            sed -i "s|repo_name|${{ env.REPO_NAME }}|g" input_prompt.txt
+            echo "Replaced repo_name with '${{ env.REPO_NAME }}' in input_prompt.txt"
+            cat input_prompt.txt
+          fi
+
+      - name: Run server and client, capture report
+        run: |
+          cd servers/github
+          nohup python main.py > server.log 2>&1 &
+          echo "🕒 Waiting for server to start..."
+          sleep 60
+          chmod +x analyze_with_files.sh run_devops_prompt.sh run_devops_prompt_without_tools.sh bash_chat_test.py direct_llm_call.py
+          ./analyze_with_files.sh
+          cp merged_static_report.txt client_output.txt
+
+      - name: Generate styled PDF
+        run: |
+          cd servers/github
+          echo "<html><head><style>body { font-family: Arial; padding: 40px; line-height: 1.6; } h1,h2,h3 { color: #2c3e50; } code { background: #f4f4f4; padding: 2px 4px; }</style></head><body>" > report.html
+          sed -e 's/^# \(.*\)$/<h1>\1<\/h1>/g' \
+              -e 's/^## \(.*\)$/<h2>\1<\/h2>/g' \
+              -e 's/^### \(.*\)$/<h3>\1<\/h3>/g' \
+              -e 's/\*\*\([^*]*\)\*\*/<strong>\1<\/strong>/g' \
+              -e 's/$/<br>/' client_output.txt >> report.html
+          echo "</body></html>" >> report.html
+          wkhtmltopdf report.html report.pdf
+
+      - name: Upload text output artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ClientTextOutput
+          path: servers/github/client_output.txt
+
+      - name: Upload PDF report artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: PDFReport
+          path: servers/github/report.pdf
+
+      - name: Upload cleaned analysis artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: BatchedOutput
+          path: servers/github/cleaned_analysis.txt
